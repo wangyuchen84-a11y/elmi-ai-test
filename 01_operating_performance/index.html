@@ -1508,6 +1508,36 @@ var API_CONFIG = {
 };
 var KEY_SS = 'elmi.apiKey';    // sessionStorage-Schluessel fuer den Dashboard-Key
 var TZ_LS  = 'elmi.timezone';  // localStorage-Schluessel fuer die Anzeigezeitzone
+var LABELS_LS = 'elmi.deviceLabels'; // {sn: label} — vom Nutzer im UI vergebene Namen (nur dieser Browser)
+
+function getLabelOverrides(){ try{ return JSON.parse(localStorage.getItem(LABELS_LS) || '{}') || {}; }catch(e){ return {}; } }
+function setLabelOverrides(map){ localStorage.setItem(LABELS_LS, JSON.stringify(map)); }
+/* Anzeigename: Browser-Override > devices.json-Label > Seriennummer. */
+function resolveLabel(dv){
+  var o = getLabelOverrides();
+  var ov = o[dv.sn];
+  return (ov && String(ov).trim()) || dv.label || dv.sn;
+}
+/* Baut die Namen-Editor-Zeilen in `wrap` neu auf (SN + Eingabefeld). */
+function renderDevNames(wrap, devices){
+  if (!wrap) return;
+  var o = getLabelOverrides();
+  wrap.innerHTML = '';
+  devices.forEach(function(dv){
+    var inp = el('input', { type: 'text', value: (o[dv.sn] || ''), placeholder: dv.label || dv.sn, style: { flex: '1', minWidth: '160px' } });
+    inp.setAttribute('data-sn', dv.sn);
+    wrap.appendChild(el('div', { class: 'elmi-devname-row' }, el('span', { class: 'elmi-sn' }, dv.sn), inp));
+  });
+}
+/* Dropdown-Beschriftungen anhand der aktuellen Namen neu setzen. */
+function relabelDropdown(){
+  var sel = document.getElementById('elmi-dev-select');
+  if (!sel || !_deviceCache) return;
+  Array.prototype.slice.call(sel.options).forEach(function(op){
+    var dv = _deviceCache.filter(function(d){ return d.sn === op.value; })[0] || { sn: op.value };
+    op.textContent = resolveLabel(dv);
+  });
+}
 
 /* ---------------- kleine DOM-Helfer -------------------------------- */
 function el(tag, attrs){
@@ -1765,7 +1795,12 @@ function ensureStyles(){
     + '.elmi-dev-list label{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--fg1,#1b1b22);}'
     + '.elmi-utc-hint{font-size:11px;color:var(--fg2,#6b6b76);margin-top:6px;}'
     + '.elmi-zone-badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:12px;background:rgba(109,42,153,.12);color:#6D2A99;font-size:11px;font-weight:600;}'
-    + '@media(max-width:380px){#elmi-live-section,#elmi-tz-section{padding:14px;}}';
+    + '#elmi-devnames-section{margin-top:14px;padding:18px 20px;border:1.5px dashed var(--elmi-orange,#F39A3A);border-radius:var(--radius-md,8px);background:rgba(243,154,58,.06);}'
+    + '#elmi-devnames-section input[type=text]{background:#fff;color:var(--fg1,#1b1b22);border:1px solid var(--border-2,#d1d1d8);border-radius:6px;padding:6px 10px;font-size:13px;}'
+    + '.elmi-devnames-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;}'
+    + '.elmi-devname-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}'
+    + '.elmi-devname-row .elmi-sn{font-family:monospace;font-size:11.5px;color:var(--fg2,#6b6b76);min-width:190px;}'
+    + '@media(max-width:380px){#elmi-live-section,#elmi-tz-section,#elmi-devnames-section{padding:14px;}}';
   document.head.appendChild(el('style', { id: 'elmi-live-api-css' }, css));
 }
 var _lastStatus = null;   // ueberlebt die Neu-Injektion des Settings-Tab
@@ -1821,7 +1856,7 @@ function buildLiveSection(){
   function fillDevSelect(devices){
     var want = _selectedSn || devSelect.value;
     devSelect.innerHTML = '';
-    devices.forEach(function(dv){ devSelect.appendChild(el('option', { value: dv.sn }, dv.label || dv.sn)); });
+    devices.forEach(function(dv){ devSelect.appendChild(el('option', { value: dv.sn }, resolveLabel(dv))); });
     if (want && devices.some(function(d){ return d.sn === want; })) devSelect.value = want;
     _selectedSn = devSelect.value;
     _deviceCache = devices;
@@ -1832,6 +1867,7 @@ function buildLiveSection(){
     try{
       var devices = await loadDeviceList();
       fillDevSelect(devices);
+      renderDevNames(document.getElementById('elmi-devnames-list'), devices);
       devHint.textContent = devices.length + ' Geraet(e) verfuegbar.';
     }catch(e){
       fillDevSelect(API_CONFIG.devices);
@@ -2051,6 +2087,32 @@ function updateZoneBadges(){
   if (b) b.textContent = tzShort(activeTz());
 }
 
+/* ================= UI: Settings-Geraetenamen ====================== */
+function buildDevNamesSection(){
+  ensureStyles();
+  var listWrap = el('div', { id: 'elmi-devnames-list', class: 'elmi-devnames-list' });
+  var hint = el('div', { class: 'elmi-utc-hint', id: 'elmi-devnames-hint' });
+  var saveBtn = el('button', { class: 'elmi-live-btn', type: 'button' }, 'Namen speichern');
+  saveBtn.addEventListener('click', function(){
+    var o = {};
+    Array.prototype.slice.call(listWrap.querySelectorAll('input[data-sn]')).forEach(function(inp){
+      var v = (inp.value || '').trim();
+      if (v) o[inp.getAttribute('data-sn')] = v;
+    });
+    setLabelOverrides(o);
+    relabelDropdown();
+    hint.textContent = '✓ Gespeichert. Leere Felder verwenden wieder die Seriennummer.';
+  });
+  var devs = (_deviceCache && _deviceCache.length) ? _deviceCache : API_CONFIG.devices;
+  renderDevNames(listWrap, devs);
+  return el('div', { id: 'elmi-devnames-section' },
+    el('div', { class: 'section-title', style: { marginTop: '0' } }, '🏷️ Geraetenamen'),
+    el('div', { class: 'settings-hint' }, 'Anzeigename je Geraet fuer das Dropdown. Wird nur in diesem Browser gespeichert; leer = Seriennummer. Fuer alle Nutzer sichtbare Namen gehoeren in devices.json.'),
+    listWrap,
+    el('div', { style: { marginTop: '10px' } }, saveBtn),
+    hint);
+}
+
 /* ================= Injektion in den Settings-/Input-Tab =========== */
 function injectSections(page){
   if (!page) return;
@@ -2066,6 +2128,12 @@ function injectSections(page){
     var liveEl = page.querySelector('#elmi-live-section');
     if (liveEl && liveEl.parentNode) liveEl.parentNode.insertBefore(tz, liveEl.nextSibling);
     else page.appendChild(tz);
+  }
+  if (!page.querySelector('#elmi-devnames-section')){
+    var dn = buildDevNamesSection();
+    var tzEl = page.querySelector('#elmi-tz-section');
+    if (tzEl && tzEl.parentNode) tzEl.parentNode.insertBefore(dn, tzEl.nextSibling);
+    else page.appendChild(dn);
   }
 }
 function tryInject(){
