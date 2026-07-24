@@ -1782,17 +1782,65 @@ function labeledField(label, input){ return el('div', { class: 'elmi-live-field'
 
 function keyIsSet(){ return !!sessionStorage.getItem(KEY_SS); }
 
+/* Geraeteliste laden. Keine Discovery-API vorhanden -> Quelle ist eine
+   Datei im Repo, die der „Aktualisieren"-Button jedes Mal frisch zieht:
+   1) devices.json  2) data/manifest.json (Dateiname->SN)  3) eingebaute Liste. */
+var _deviceCache = null;
+var _selectedSn = null;   // gewaehltes Geraet ueber Neu-Injektionen hinweg merken
+async function loadDeviceList(){
+  try{
+    var r = await fetch('devices.json?t=' + Date.now(), { cache: 'no-store' });
+    if (r.ok){
+      var j = await r.json();
+      var arr = Array.isArray(j) ? j : ((j && j.devices) || []);
+      var devs = arr.map(function(d){ return (typeof d === 'string') ? { sn: d, label: d } : { sn: d.sn, label: d.label || d.sn }; })
+                    .filter(function(d){ return d.sn; });
+      if (devs.length) return devs;
+    }
+  }catch(e){}
+  try{
+    var r2 = await fetch('data/manifest.json?t=' + Date.now(), { cache: 'no-store' });
+    if (r2.ok){
+      var names = await r2.json();
+      var devs2 = (names || []).map(function(n){ var sn = String(n).replace(/\.(xlsx|xls)$/i, ''); return { sn: sn, label: sn }; })
+                               .filter(function(d){ return d.sn; });
+      if (devs2.length) return devs2;
+    }
+  }catch(e){}
+  return API_CONFIG.devices.slice();
+}
+
 function buildLiveSection(){
   ensureStyles();
   var status = el('div', { id: 'elmi-live-status', class: 'elmi-live-status hidden' });
 
-  /* Geraeteauswahl (Checkboxen) */
-  var devList = el('div', { class: 'elmi-dev-list', id: 'elmi-dev-list' });
-  API_CONFIG.devices.forEach(function(dv, i){
-    var cb = el('input', { type: 'checkbox', value: dv.sn });
-    if (i === 0) cb.checked = true;
-    devList.appendChild(el('label', null, cb, dv.label));
-  });
+  /* Geraeteauswahl: Dropdown + „Geraeteliste aktualisieren"-Button */
+  var devSelect = el('select', { id: 'elmi-dev-select', style: { minWidth: '260px' } });
+  var devUpdateBtn = el('button', { class: 'elmi-chip-btn', type: 'button' }, '🔄 Geraeteliste aktualisieren');
+  var devHint = el('div', { class: 'elmi-utc-hint', id: 'elmi-dev-hint' });
+  function fillDevSelect(devices){
+    var want = _selectedSn || devSelect.value;
+    devSelect.innerHTML = '';
+    devices.forEach(function(dv){ devSelect.appendChild(el('option', { value: dv.sn }, dv.label || dv.sn)); });
+    if (want && devices.some(function(d){ return d.sn === want; })) devSelect.value = want;
+    _selectedSn = devSelect.value;
+    _deviceCache = devices;
+  }
+  devSelect.addEventListener('change', function(){ _selectedSn = devSelect.value; });
+  async function refreshDevices(){
+    var orig = devUpdateBtn.textContent; devUpdateBtn.disabled = true; devUpdateBtn.textContent = '⏳ …';
+    try{
+      var devices = await loadDeviceList();
+      fillDevSelect(devices);
+      devHint.textContent = devices.length + ' Geraet(e) verfuegbar.';
+    }catch(e){
+      fillDevSelect(API_CONFIG.devices);
+      devHint.textContent = 'Standardliste — Aktualisierung fehlgeschlagen.';
+    }finally{ devUpdateBtn.disabled = false; devUpdateBtn.textContent = orig; }
+  }
+  devUpdateBtn.addEventListener('click', refreshDevices);
+  if (_deviceCache && _deviceCache.length){ fillDevSelect(_deviceCache); devHint.textContent = _deviceCache.length + ' Geraet(e) verfuegbar.'; }
+  else { fillDevSelect(API_CONFIG.devices); refreshDevices(); }
 
   /* Zeitraum */
   var today = zonedToday(activeTz());
@@ -1865,7 +1913,7 @@ function buildLiveSection(){
   var cancelBtn = el('button', { class: 'elmi-chip-btn', type: 'button', style: { display: 'none' } }, 'Abbrechen');
   cancelBtn.addEventListener('click', function(){ if (_abort) _abort.abort(); });
 
-  btn.addEventListener('click', function(){ runFetch(devList, fromInput, toInput, keyInput, status, btn, cancelBtn, switchWrap, refreshKeyUi); });
+  btn.addEventListener('click', function(){ runFetch(devSelect, fromInput, toInput, keyInput, status, btn, cancelBtn, switchWrap, refreshKeyUi); });
 
   /* Zustand nach Neu-Injektion (Recompute rebaut den Settings-Tab) wiederherstellen */
   if (_lastStatus) showStatus(status, _lastStatus.msg, _lastStatus.type);
@@ -1875,8 +1923,9 @@ function buildLiveSection(){
   return el('div', { id: 'elmi-live-section' },
     el('div', { class: 'section-title', style: { marginTop: '0' } }, '🔌 Live-Daten abrufen'),
     el('div', { class: 'settings-hint' }, 'Ruft Telemetrie direkt ueber den gesicherten ELMI-Worker ab — kein Excel-Export noetig. Daten landen im selben Speicher wie hochgeladene Dateien.'),
-    el('div', { class: 'input-hint', style: { marginTop: '12px' } }, 'Geraete'),
-    devList,
+    el('div', { class: 'input-hint', style: { marginTop: '12px' } }, 'Geraet'),
+    el('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', marginTop: '6px' } }, devSelect, devUpdateBtn),
+    devHint,
     el('div', { class: 'input-hint', style: { marginTop: '12px' } }, 'Zeitraum'),
     el('div', { style: { display: 'flex', gap: '10px', alignItems: 'flex-end', flexWrap: 'wrap' } },
       labeledField('Von', fromInput), labeledField('Bis', toInput)),
@@ -1887,10 +1936,11 @@ function buildLiveSection(){
     status);
 }
 
-async function runFetch(devList, fromInput, toInput, keyInput, status, btn, cancelBtn, switchWrap, refreshKeyUi){
+async function runFetch(devSelect, fromInput, toInput, keyInput, status, btn, cancelBtn, switchWrap, refreshKeyUi){
   var tz = activeTz();
-  var sns = Array.prototype.slice.call(devList.querySelectorAll('input:checked')).map(function(c){ return c.value; });
-  if (!sns.length){ showStatus(status, '⚠️ Bitte mindestens ein Geraet waehlen.', 'warn'); return; }
+  var sns = devSelect.value ? [devSelect.value] : [];
+  if (!sns.length){ showStatus(status, '⚠️ Bitte ein Geraet auswaehlen (ggf. erst „Geraeteliste aktualisieren").', 'warn'); return; }
+  _selectedSn = sns[0];
   var f = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fromInput.value), t = /^(\d{4})-(\d{2})-(\d{2})$/.exec(toInput.value);
   if (!f || !t){ showStatus(status, '⚠️ Bitte Von- und Bis-Datum waehlen.', 'warn'); return; }
   var fromUtc = zonedToUtc(+f[1], +f[2], +f[3], 0, 0, tz);
