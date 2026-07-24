@@ -1467,248 +1467,586 @@ var _msi = 0, _msiv = setInterval(function(){
 </script>
 
 <script>
-/* ELMI Live-API Loader Extension v1
-   Adds a "🔄 Live-Daten abrufen" button + date range to the Settings
-   (#input) tab, fetching telemetry from the elmi-station-proxy Cloudflare
-   Worker (which holds the upstream API credentials — never exposed here)
-   and feeding it through the same window.ELMI.app.applyDB() used by the
-   Excel upload, so every dashboard page recomputes automatically.
-   Sits alongside the Multi-Station Loader Extension above; same
-   bolt-on / MutationObserver pattern since the Settings tab DOM is
-   rebuilt from scratch on every recompute.
-*/
+/* ============================================================
+   ELMI Live-API + Anzeige-Zeitzone — Erweiterung v2
+   ------------------------------------------------------------
+   Ersetzt die alte elmi-station-proxy-Anbindung. Holt Telemetrie
+   vom Cloudflare Worker `elmi-device-analysis`. Der Dashboard-Key
+   liegt ausschliesslich in sessionStorage (nie im Repo). Daten
+   werden in denselben Stations-Store wie der Excel-Pfad geschrieben
+   (elmi_cpo_db) und ueber window.ELMI.app.applyDB() gerendert.
+
+   Zeitzone: In IndexedDB stehen ausschliesslich UTC-Instants
+   (epoch ms). Der Kern rendert per getUTC*(); daher verschieben
+   wir die t-Werte NUR fuer die Anzeige um den DST-korrekten
+   Zonen-Offset (Display-Shift), ohne die gespeicherten Werte oder
+   die Kern-Logik zu aendern. Das Settings-Dropdown rechnet damit
+   alle Ansichten sofort von UTC in die gewaehlte Zone um — ohne
+   Neu-Abruf und ohne Page-Reload.
+   ============================================================ */
 (function(){
 'use strict';
 
-// === Fill in once the Worker is deployed (see elmi-station-proxy/README.md) ===
-var WORKER_URL = 'https://elmi-station-proxy.wangyuchen84.workers.dev';
-// Abuse guard only (not real auth) — matches the Worker's PROXY_ACCESS_TOKEN secret.
-var PROXY_KEY  = 'e7a0e8ebf0dfcd060f721f1696c288c6a699d7b0ec5a182b34efdc2700b7760e';
-
-var KNOWN_STATUSES = ['Available','Charging','Finishing','Preparing','Starting'];
-// Upstream vocabulary (IDLE/CONNECTED/CHARGING) doesn't match the dashboard's
-// fixed status list — best-effort mapping; anything unrecognized passes through raw.
-var STATUS_MAP = { IDLE: 'Available', CONNECTED: 'Preparing', CHARGING: 'Charging' };
-var ERROR_MESSAGES = {
-  auth_failed:    'Anmeldung am Proxy fehlgeschlagen (Zugangsdaten prüfen).',
-  forbidden:      'Kein Zugriff auf diese Station (Account hat keine Berechtigung).',
-  upstream_error: 'Fehler in der Testumgebung.',
-  unreachable:    'Testumgebung aktuell nicht erreichbar (evtl. VPN-Beschränkung).',
-  bad_request:    'Ungültige Eingabe (SN oder Zeitraum prüfen).'
+/* ---------------- Konfiguration (enthaelt KEINE Zugangsdaten) ------ */
+var API_CONFIG = {
+  workerBase: 'https://elmi-device-analysis.wangyuchen84.workers.dev',
+  devices: [
+    { sn: 'A111120000001251128001', label: 'A111120000001251128001' },
+    { sn: 'A131120000001251225002', label: 'A131120000001251225002' },
+    { sn: 'A131120000001251225004', label: 'A131120000001251225004' },
+    { sn: 'A131120000001251225005', label: 'A131120000001251225005' },
+    { sn: 'A131120000002251225003', label: 'A131120000002251225003' }
+  ],
+  maxRangeDays: 366,
+  timezones: [
+    { id: 'Europe/Berlin',  label: 'Europa/Berlin (MEZ/MESZ)' },
+    { id: 'UTC',            label: 'UTC' },
+    { id: 'Asia/Shanghai',  label: 'Asien/Shanghai (CST)' },
+    { id: 'Asia/Singapore', label: 'Asien/Singapur (SGT)' }
+  ],
+  defaultTimezone: 'Europe/Berlin'
 };
+var KEY_SS = 'elmi.apiKey';    // sessionStorage-Schluessel fuer den Dashboard-Key
+var TZ_LS  = 'elmi.timezone';  // localStorage-Schluessel fuer die Anzeigezeitzone
 
-// rows already fetched per SN, keyed by timestamp — dedupes across repeated clicks
-var LiveCache = {};
-
+/* ---------------- kleine DOM-Helfer -------------------------------- */
 function el(tag, attrs){
   var e = document.createElement(tag);
   if (attrs) Object.keys(attrs).forEach(function(k){
     var v = attrs[k];
     if (k === 'style' && typeof v === 'object') Object.assign(e.style, v);
-    else e.setAttribute(k, v);
+    else if (v != null) e.setAttribute(k, v);
   });
-  for (var i = 2; i < arguments.length; i++) {
+  for (var i = 2; i < arguments.length; i++){
     var c = arguments[i];
     if (c == null) continue;
-    if (typeof c === 'string' || typeof c === 'number') { e.appendChild(document.createTextNode(String(c))); continue; }
-    if (c instanceof Node) { e.appendChild(c); continue; }
+    if (typeof c === 'string' || typeof c === 'number'){ e.appendChild(document.createTextNode(String(c))); continue; }
+    if (c instanceof Node){ e.appendChild(c); continue; }
   }
   return e;
 }
+function num(v){
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return isNaN(v) ? null : v;
+  var s = String(v).replace(',', '.');
+  return isNaN(+s) ? null : +s;
+}
+function pad(n){ return String(n).padStart(2, '0'); }
+function fmtStamp(d){ return pad(d.getDate())+'.'+pad(d.getMonth()+1)+'.'+d.getFullYear()+' '+pad(d.getHours())+':'+pad(d.getMinutes()); }
 
+/* ================= Zeitzonen-Helfer (DST-korrekt) ================= *
+ * Ausschliesslich diese Funktionen rechnen Zeit um. Niemals
+ * getTimezoneOffset() (das ist die Browserzone, nicht die gewaehlte).  */
+function tzOffsetMs(instant, tz){
+  var dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  var p = {};
+  dtf.formatToParts(instant).forEach(function(x){ p[x.type] = x.value; });
+  var asUtc = Date.UTC(p.year, p.month - 1, p.day, (p.hour === '24' ? 0 : p.hour), p.minute, p.second);
+  return asUtc - instant.getTime();
+}
+/* Offset-Cache pro voller Stunde: DST-Wechsel liegen auf Stundengrenzen,
+   damit bleibt die Umrechnung exakt und schnell (statt 40k Intl-Aufrufe). */
+var _offCache = {};
+function offsetForMs(ms, tz){
+  if (tz === 'UTC') return 0;
+  var hourKey = tz + '|' + Math.floor(ms / 3600000);
+  var c = _offCache[hourKey];
+  if (c != null) return c;
+  var off = tzOffsetMs(new Date(ms), tz);
+  _offCache[hourKey] = off;
+  return off;
+}
+/* Wanduhrzeit in der gewaehlten Zone -> UTC-Instant. Zwei Durchlaeufe wegen DST. */
+function zonedToUtc(y, m, d, h, min, tz){
+  if (tz === 'UTC') return new Date(Date.UTC(y, m - 1, d, h, min));
+  var naive = Date.UTC(y, m - 1, d, h, min);
+  var ts = naive - tzOffsetMs(new Date(naive), tz);
+  ts = naive - tzOffsetMs(new Date(ts), tz);
+  return new Date(ts);
+}
+/* Kalender-Datum "heute" in der gewaehlten Zone als {y,m,d}. */
+function zonedToday(tz){
+  var p = {};
+  new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date()).forEach(function(x){ p[x.type] = x.value; });
+  return { y: +p.year, m: +p.month, d: +p.day };
+}
+function activeTz(){ return localStorage.getItem(TZ_LS) || API_CONFIG.defaultTimezone; }
+function tzShort(tz){
+  try{
+    var parts = new Intl.DateTimeFormat('de-DE', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date());
+    var z = parts.filter(function(p){ return p.type === 'timeZoneName'; })[0];
+    return z ? z.value : tz;
+  }catch(e){ return tz; }
+}
+function isoUtcTrim(d){ return d.toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+
+/* ============ Display-Shift + applyDB-Patch (Kern bleibt UTC) ====== *
+ * Der Kern zeigt Zeiten via getUTC*(). Wir uebergeben ihm daher eine
+ * Projektion, in der jeder t-Wert um den Zonen-Offset verschoben ist.
+ * Der kanonische UTC-Wert bleibt in r._utc erhalten; gespeichert wird
+ * immer nur die kanonische (unverschobene) DB.                         */
+function projectDbToZone(db, tz){
+  if (!db || !Array.isArray(db.rows)) return db;
+  var rows = db.rows.map(function(r){
+    var utc = (r._utc != null ? r._utc : r.t);
+    return Object.assign({}, r, { t: utc + offsetForMs(utc, tz), _utc: utc });
+  });
+  return Object.assign({}, db, { rows: rows });
+}
+
+var _origApplyDB = null;
+var _canonicalDb = null;   // zuletzt geladene DB in kanonischem UTC
+function installApplyPatch(){
+  var A = window.ELMI && window.ELMI.app;
+  if (!A || A._tzPatched) return !!(A && A._tzPatched);
+  _origApplyDB = A.applyDB.bind(A);
+  A.applyDB = function(db, sourceName){
+    _canonicalDb = db;                      // Original (UTC) merken, nicht projizieren
+    return _origApplyDB(projectDbToZone(db, activeTz()), sourceName);
+  };
+  A._tzPatched = true;
+  return true;
+}
+/* Zone gewechselt: dieselben Daten in der neuen Zone neu rendern. */
+function reapplyZone(){
+  var A = window.ELMI && window.ELMI.app;
+  if (!A || !_origApplyDB || !_canonicalDb) return;
+  var src = A._dataSource;
+  _origApplyDB(projectDbToZone(_canonicalDb, activeTz()), null);
+  A._dataSource = src;                      // Quelle unveraendert lassen
+  if (typeof A.render === 'function') A.render();
+  updateZoneBadges();
+}
+
+/* ================= gemeinsame IndexedDB-Persistenz ================= *
+ * Schreibt in denselben Store wie der Excel-Pfad: elmi_cpo_db ->
+ * stations_data -> Schluessel 'last_stations' (Array {sn,fileName,db}). */
+var PERSIST_DB = 'elmi_cpo_db', PERSIST_STORE = 'stations_data', PERSIST_KEY = 'last_stations';
+function openPersistDB(){
+  return new Promise(function(resolve, reject){
+    var req = indexedDB.open(PERSIST_DB, 1);
+    req.onupgradeneeded = function(e){
+      var d = e.target.result;
+      if (!d.objectStoreNames.contains(PERSIST_STORE)) d.createObjectStore(PERSIST_STORE);
+    };
+    req.onsuccess = function(e){ resolve(e.target.result); };
+    req.onerror = function(e){ reject(e.target.error); };
+  });
+}
+function idbGet(db, store, key){
+  return new Promise(function(res, rej){
+    var tx = db.transaction(store, 'readonly');
+    var r = tx.objectStore(store).get(key);
+    r.onsuccess = function(){ res(r.result); };
+    r.onerror = function(e){ rej(e.target.error); };
+  });
+}
+function idbPut(db, store, val, key){
+  return new Promise(function(res, rej){
+    var tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(val, key);
+    tx.oncomplete = res;
+    tx.onerror = function(e){ rej(e.target.error); };
+  });
+}
+function safeSerialize(o){ try{ return JSON.parse(JSON.stringify(o)); }catch(e){ return null; } }
+
+/* Stationen aus einem Fetch mergen (idempotent nach SN) und speichern.
+   Bestehende Stationen bleiben erhalten; gleiche SN wird ersetzt. */
+async function persistApiStations(stationMap){
+  try{
+    var db = await openPersistDB();
+    var existing = (await idbGet(db, PERSIST_STORE, PERSIST_KEY)) || [];
+    var bySn = {};
+    existing.forEach(function(s){ if (s && s.sn) bySn[s.sn] = s; });
+    Object.keys(stationMap).forEach(function(sn){
+      bySn[sn] = { sn: sn, fileName: 'Live API', db: safeSerialize(stationMap[sn]) };
+    });
+    var merged = Object.keys(bySn).map(function(k){ return bySn[k]; }).filter(function(s){ return s && s.db; });
+    await idbPut(db, PERSIST_STORE, merged, PERSIST_KEY);
+    db.close();
+    localStorage.setItem('elmi_last_upload', new Date().toISOString());
+  }catch(err){ console.error('[elmi-live] persist failed', err); }
+}
+
+/* ================= API-Client ===================================== */
+function statusRaw(v){
+  if (v == null) return null;
+  var s = String(v).trim();
+  return s || null;   // unveraendert durchreichen, kein Enum-Mapping
+}
+/* API-Zeilen einer SN -> internes Kern-Schema (spiegelt parseWorkbook/rowsToDB):
+   Fill-forward fuer kumulative Zaehler/SOC, 0 fuer Momentanleistung. */
+function apiRowsToRows(apiRows){
+  var last = null, rows = [];
+  apiRows.forEach(function(r){
+    var t = Date.parse(r.collectTimeIso || r.collectTime);
+    if (isNaN(t)) return;
+    var ff = function(raw, key){ var v = num(raw); return (v == null && last) ? last[key] : v; };
+    var o = {
+      t: t,
+      ac_kwh: ff(r.acMeter, 'ac_kwh'),      ac_kw: num(r.acPower) || 0,
+      bat_soc: ff(r.batterySoc, 'bat_soc'), bat_kw: num(r.batteryPower) || 0,
+      g1_kwh: ff(r.gun1DcMeter, 'g1_kwh'),  g1_soc: ff(r.gun1Soc, 'g1_soc') || 0, g1_kw: num(r.gun1RealPwr) || 0, g1_st: statusRaw(r.gun1GunStatus),
+      g2_kwh: ff(r.gun2DcMeter, 'g2_kwh'),  g2_soc: ff(r.gun2Soc, 'g2_soc') || 0, g2_kw: num(r.gun2RealPwr) || 0, g2_st: statusRaw(r.gun2GunStatus),
+      gap: num(r.gun1DcMeter) == null && num(r.gun2DcMeter) == null,
+      source: 'api'
+    };
+    last = o;
+    rows.push(o);
+  });
+  rows.sort(function(a, b){ return a.t - b.t; });
+  return rows;
+}
+function utcLabel(ms){
+  var d = new Date(ms);
+  return d.getUTCFullYear()+'-'+pad(d.getUTCMonth()+1)+'-'+pad(d.getUTCDate())+' '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes());
+}
+function buildDB(sn, rows){
+  var days = {};
+  rows.forEach(function(r){ days[utcLabel(r.t).slice(0, 10)] = true; });
+  return {
+    sn: sn,
+    start: rows.length ? utcLabel(rows[0].t) : '',
+    statuses: ['Available', 'Charging', 'Finishing', 'Preparing', 'Starting'],
+    rows: rows,
+    _meta: {
+      rowCount: rows.length, dayCount: Object.keys(days).length,
+      from: rows.length ? utcLabel(rows[0].t) : '',
+      to:   rows.length ? utcLabel(rows[rows.length - 1].t) : ''
+    }
+  };
+}
+
+/* Ruft den Worker ab. Wirft Fehler mit .code (401/403/…). */
+async function fetchDeviceAnalysis(opts){
+  var key = sessionStorage.getItem(KEY_SS);
+  if (!key){ var e0 = new Error('Dashboard-Key fehlt'); e0.code = 'NOKEY'; throw e0; }
+  var url = API_CONFIG.workerBase.replace(/\/$/, '') + '/device-analysis'
+    + '?sn=' + encodeURIComponent(opts.sns.join(','))
+    + '&startTime=' + encodeURIComponent(isoUtcTrim(opts.from))
+    + '&endTime=' + encodeURIComponent(isoUtcTrim(opts.to));
+  if (opts.onProgress) opts.onProgress('Verbinde mit Server…');
+  var res = await fetch(url, { headers: { 'X-ELMI-Key': key }, signal: opts.signal });
+  var body = null; try{ body = await res.json(); }catch(e){}
+  if (res.status === 401){ sessionStorage.removeItem(KEY_SS); var e1 = new Error('Dashboard-Key fehlt oder ist ungueltig'); e1.code = 401; throw e1; }
+  if (res.status === 403){ var e2 = new Error('Account hat keine Berechtigung fuer die Abfrage'); e2.code = 403; throw e2; }
+  if (!res.ok){ var m = (body && body.msg) || ('HTTP ' + res.status); var e3 = new Error('Backend nicht erreichbar: ' + m); e3.code = res.status; throw e3; }
+  if (opts.onProgress) opts.onProgress('Verarbeite Datensaetze…');
+  return { rows: (body && body.rows) || [], errors: (body && body.errors) || [], total: (body && body.total) || 0 };
+}
+
+/* ================= Styles ========================================= */
 function ensureStyles(){
   if (document.getElementById('elmi-live-api-css')) return;
   var css = ''
-    + '#elmi-live-section{margin-top:14px;padding:18px 20px;border:1.5px dashed var(--elmi-orange,#F39A3A);border-radius:var(--radius-md,8px);background:rgba(243,154,58,.06);}'
-    + '#elmi-live-section input[type=date],#elmi-live-section input[type=text]{background:#fff;color:var(--fg1,#1b1b22);border:1px solid var(--border-2,#d1d1d8);border-radius:6px;padding:6px 10px;font-size:13px;}'
-    + '.elmi-live-btn{display:inline-block;padding:9px 16px;border:none;border-radius:var(--radius-md,8px);background:var(--color-accent,var(--elmi-orange,#F39A3A));color:#fff;font-size:13px;font-weight:600;cursor:pointer;align-self:flex-end;}'
+    + '#elmi-live-section,#elmi-tz-section{margin-top:14px;padding:18px 20px;border:1.5px dashed var(--elmi-orange,#F39A3A);border-radius:var(--radius-md,8px);background:rgba(243,154,58,.06);}'
+    + '#elmi-live-section input[type=date],#elmi-live-section input[type=password],#elmi-live-section select,#elmi-tz-section select{background:#fff;color:var(--fg1,#1b1b22);border:1px solid var(--border-2,#d1d1d8);border-radius:6px;padding:6px 10px;font-size:13px;}'
+    + '.elmi-live-btn{display:inline-block;padding:9px 16px;border:none;border-radius:var(--radius-md,8px);background:var(--color-accent,var(--elmi-orange,#F39A3A));color:#fff;font-size:13px;font-weight:600;cursor:pointer;}'
     + '.elmi-live-btn:disabled{opacity:.55;cursor:not-allowed;}'
     + '.elmi-live-btn:hover:not(:disabled){filter:brightness(1.06);}'
-    + '.elmi-live-status{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:12.5px;}'
+    + '.elmi-chip-btn{padding:6px 11px;border:1px solid var(--border-2,#d1d1d8);border-radius:16px;background:#fff;color:var(--fg1,#1b1b22);font-size:12px;cursor:pointer;}'
+    + '.elmi-chip-btn:hover{border-color:var(--elmi-orange,#F39A3A);}'
+    + '.elmi-ghost-link{background:none;border:none;color:#1168cc;font-size:12px;cursor:pointer;text-decoration:underline;padding:0;}'
+    + '.elmi-live-status{margin-top:12px;padding:10px 14px;border-radius:8px;font-size:12.5px;white-space:pre-line;}'
     + '.elmi-live-status.hidden{display:none!important;}'
     + '.elmi-live-status.ok{background:rgba(31,157,85,.12);color:#1F9D55;}'
     + '.elmi-live-status.warn{background:rgba(226,161,0,.16);color:#8a6300;}'
     + '.elmi-live-status.error{background:rgba(227,32,40,.12);color:#E32028;}'
     + '.elmi-live-status.info{background:rgba(30,120,220,.10);color:#1168cc;}'
     + '.elmi-live-field{display:flex;flex-direction:column;gap:2px;}'
-    + '.elmi-live-field label{font-size:11px;color:var(--fg2,#6b6b76);}';
-  document.head.appendChild(el('style', {id:'elmi-live-api-css'}, css));
+    + '.elmi-live-field label{font-size:11px;color:var(--fg2,#6b6b76);}'
+    + '.elmi-dev-list{display:flex;flex-direction:column;gap:5px;max-height:150px;overflow:auto;margin-top:6px;}'
+    + '.elmi-dev-list label{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--fg1,#1b1b22);}'
+    + '.elmi-utc-hint{font-size:11px;color:var(--fg2,#6b6b76);margin-top:6px;}'
+    + '.elmi-zone-badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:12px;background:rgba(109,42,153,.12);color:#6D2A99;font-size:11px;font-weight:600;}'
+    + '@media(max-width:380px){#elmi-live-section,#elmi-tz-section{padding:14px;}}';
+  document.head.appendChild(el('style', { id: 'elmi-live-api-css' }, css));
 }
-
+var _lastStatus = null;   // ueberlebt die Neu-Injektion des Settings-Tab
 function showStatus(host, msg, type){
-  host.textContent = msg;
-  host.className = 'elmi-live-status ' + type;
+  host.textContent = msg; host.className = 'elmi-live-status ' + type;
+  _lastStatus = { msg: msg, type: type };
 }
 
-function fmtTimestamp(d){
-  var p = function(n){ return String(n).padStart(2,'0'); };
-  return p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear()+' '+p(d.getHours())+':'+p(d.getMinutes());
-}
+/* ================= UI: Live-Daten-Karte =========================== */
+var _abort = null;
+var _fetchedDbs = {};   // sn -> kanonische DB dieser Session (fuer In-Session-Umschaltung)
 
-function isoDate(d){ return d.toISOString().slice(0,10); }
-function daysAgo(n){ var d = new Date(); d.setUTCDate(d.getUTCDate()-n); return d; }
+function labeledField(label, input){ return el('div', { class: 'elmi-live-field' }, el('label', null, label), input); }
 
-function currentSN(){
-  try{ return window.ELMI.compute.getDB().sn || ''; }catch(e){ return ''; }
-}
-
-var num = function(v){ return (v==null||v==='') ? null : (typeof v==='number'? v : (isNaN(+String(v).replace(',','.')) ? null : +String(v).replace(',','.'))); };
-
-function mapStatus(v){
-  if (v == null) return null;
-  var s = String(v).trim();
-  if (!s) return null;
-  return STATUS_MAP[s.toUpperCase()] || s;
-}
-
-// Mirrors parseWorkbook's rowsToDB(): fill-forward for meter/SOC readings,
-// zero-fallback for instantaneous power — so live rows behave identically
-// to Excel-uploaded rows in every downstream chart.
-function apiRowsToRows(apiRows){
-  var last = null, rows = [];
-  apiRows.forEach(function(r){
-    var t = Date.parse(r.collectTime);
-    if (isNaN(t)) return;
-    var ff = function(raw, key){ var v = num(raw); return (v==null && last) ? last[key] : v; };
-    var g1st = mapStatus(r.gun1GunStatus), g2st = mapStatus(r.gun2GunStatus);
-    var o = {
-      t: t,
-      ac_kwh: ff(r.acMeter,'ac_kwh'),   ac_kw: num(r.acPower)||0,
-      bat_soc: ff(r.batterySoc,'bat_soc'), bat_kw: num(r.batteryPower)||0,
-      g1_kwh: ff(r.gun1DcMeter,'g1_kwh'), g1_soc: ff(r.gun1Soc,'g1_soc')||0, g1_kw: num(r.gun1RealPwr)||0, g1_st: g1st,
-      g2_kwh: ff(r.gun2DcMeter,'g2_kwh'), g2_soc: ff(r.gun2Soc,'g2_soc')||0, g2_kw: num(r.gun2RealPwr)||0, g2_st: g2st,
-      gap: num(r.gun1DcMeter)==null && num(r.gun2DcMeter)==null
-    };
-    last = o;
-    rows.push(o);
-  });
-  return rows;
-}
-
-function mergeRows(sn, newRows){
-  var map = LiveCache[sn] || (LiveCache[sn] = {});
-  newRows.forEach(function(r){ map[r.t] = r; });
-  var merged = Object.keys(map).map(function(k){ return map[k]; });
-  merged.sort(function(a,b){ return a.t - b.t; });
-  return merged;
-}
-
-function utcLabel(ms){
-  var d = new Date(ms), p = function(n){ return String(n).padStart(2,'0'); };
-  return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes());
-}
-
-function buildDB(sn, rows){
-  var days = {};
-  rows.forEach(function(r){ days[utcLabel(r.t).slice(0,10)] = true; });
-  return {
-    sn: sn,
-    start: rows.length ? utcLabel(rows[0].t) : '',
-    statuses: KNOWN_STATUSES,
-    rows: rows,
-    _meta: {
-      rowCount: rows.length,
-      dayCount: Object.keys(days).length,
-      from: rows.length ? utcLabel(rows[0].t) : '',
-      to:   rows.length ? utcLabel(rows[rows.length-1].t) : ''
-    }
-  };
-}
-
-async function fetchLiveData(sn, fromDate, toDate, statusBox, btn){
-  var startTime = new Date(fromDate+'T00:00:00Z').toISOString();
-  var endTime   = new Date(toDate+'T23:59:59Z').toISOString();
-  var origLabel = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = '⏳ Lädt…';
-  showStatus(statusBox, '⏳ Rufe Live-Daten ab…', 'info');
-  try{
-    var url = WORKER_URL.replace(/\/$/, '') + '/station-data'
-      + '?sn=' + encodeURIComponent(sn)
-      + '&startTime=' + encodeURIComponent(startTime)
-      + '&endTime=' + encodeURIComponent(endTime);
-    var res = await fetch(url, { headers: { 'X-Proxy-Key': PROXY_KEY } });
-    var body = null;
-    try{ body = await res.json(); }catch(e){}
-    if (!res.ok || !body || body.error) {
-      var msg = ERROR_MESSAGES[(body && body.error) || ''] || ('Fehler beim Abruf (Status ' + res.status + ').');
-      showStatus(statusBox, '❌ ' + msg, 'error');
-      return;
-    }
-    var apiRows = Array.isArray(body.rows) ? body.rows : [];
-    var merged = mergeRows(sn, apiRowsToRows(apiRows));
-    if (!merged.length) {
-      showStatus(statusBox, '⚠️ Keine Datenpunkte im gewählten Zeitraum.', 'warn');
-      return;
-    }
-    var db = buildDB(sn, merged);
-    window.ELMI.app.applyDB(db, null); // null: keep current _dataSource, we set it explicitly below
-    window.ELMI.app._dataSource = 'Live API · ' + sn + ' · ' + fmtTimestamp(new Date());
-    window.ELMI.app.render();
-    showStatus(statusBox, '✅ ' + merged.length.toLocaleString('de') + ' Datenpunkte geladen (gesamt für SN ' + sn + ').', 'ok');
-  }catch(err){
-    showStatus(statusBox, '❌ Netzwerkfehler: ' + (err.message||err), 'error');
-  }finally{
-    btn.disabled = false;
-    btn.textContent = origLabel;
-  }
-}
-
-function labeledField(label, input){
-  return el('div', {class:'elmi-live-field'}, el('label', null, label), input);
-}
+function keyIsSet(){ return !!sessionStorage.getItem(KEY_SS); }
 
 function buildLiveSection(){
-  var snInput = el('input', {type:'text', id:'elmi-live-sn', value: currentSN(), style:{width:'160px'}});
-  var fromInput = el('input', {type:'date', id:'elmi-live-from', value: isoDate(daysAgo(7))});
-  var toInput = el('input', {type:'date', id:'elmi-live-to', value: isoDate(new Date())});
-  var status = el('div', {id:'elmi-live-status', class:'elmi-live-status hidden'});
-  var btn = el('button', {id:'elmi-live-btn', class:'elmi-live-btn', type:'button'}, '🔄 Live-Daten abrufen');
-  btn.addEventListener('click', function(){
-    var sn = (snInput.value||'').trim();
-    if (!sn) { showStatus(status, '⚠️ Bitte Stations-SN angeben.', 'warn'); return; }
-    if (!fromInput.value || !toInput.value) { showStatus(status, '⚠️ Bitte Zeitraum wählen.', 'warn'); return; }
-    fetchLiveData(sn, fromInput.value, toInput.value, status, btn);
+  ensureStyles();
+  var status = el('div', { id: 'elmi-live-status', class: 'elmi-live-status hidden' });
+
+  /* Geraeteauswahl (Checkboxen) */
+  var devList = el('div', { class: 'elmi-dev-list', id: 'elmi-dev-list' });
+  API_CONFIG.devices.forEach(function(dv, i){
+    var cb = el('input', { type: 'checkbox', value: dv.sn });
+    if (i === 0) cb.checked = true;
+    devList.appendChild(el('label', null, cb, dv.label));
   });
-  return el('div', {id:'elmi-live-section'},
-    el('div', {class:'section-title', style:{marginTop:'0'}}, '🔌 Live-Daten von der Ladestation'),
-    el('div', {class:'settings-hint'}, 'Ruft aktuelle Telemetriedaten direkt über einen gesicherten Proxy ab und ergänzt den aktuellen Datensatz — kein Excel-Export nötig.'),
-    el('div', {style:{display:'flex', gap:'10px', alignItems:'flex-end', flexWrap:'wrap', marginTop:'10px'}},
-      labeledField('Stations-SN', snInput), labeledField('Von', fromInput), labeledField('Bis', toInput), btn),
+
+  /* Zeitraum */
+  var today = zonedToday(activeTz());
+  var toStr = today.y + '-' + pad(today.m) + '-' + pad(today.d);
+  var fromInit = new Date(Date.UTC(today.y, today.m - 1, today.d));
+  fromInit.setUTCDate(fromInit.getUTCDate() - 6);
+  var fromStr = fromInit.getUTCFullYear() + '-' + pad(fromInit.getUTCMonth() + 1) + '-' + pad(fromInit.getUTCDate());
+  var fromInput = el('input', { type: 'date', id: 'elmi-live-from', value: fromStr });
+  var toInput   = el('input', { type: 'date', id: 'elmi-live-to',   value: toStr });
+  var utcHint   = el('div', { class: 'elmi-utc-hint', id: 'elmi-utc-hint' });
+
+  function setRange(fY, fM, fD, tY, tM, tD){
+    fromInput.value = fY + '-' + pad(fM) + '-' + pad(fD);
+    toInput.value   = tY + '-' + pad(tM) + '-' + pad(tD);
+    updateUtcHint();
+  }
+  function quick(kind){
+    var tz = activeTz(), td = zonedToday(tz);
+    var base = new Date(Date.UTC(td.y, td.m - 1, td.d));
+    if (kind === '7'){ var f = new Date(base); f.setUTCDate(f.getUTCDate() - 6); setRange(f.getUTCFullYear(), f.getUTCMonth()+1, f.getUTCDate(), td.y, td.m, td.d); }
+    else if (kind === '30'){ var f2 = new Date(base); f2.setUTCDate(f2.getUTCDate() - 29); setRange(f2.getUTCFullYear(), f2.getUTCMonth()+1, f2.getUTCDate(), td.y, td.m, td.d); }
+    else if (kind === 'cur'){ setRange(td.y, td.m, 1, td.y, td.m, td.d); }
+    else if (kind === 'last'){
+      var lm = td.m === 1 ? 12 : td.m - 1, ly = td.m === 1 ? td.y - 1 : td.y;
+      var lastDay = new Date(Date.UTC(ly, lm, 0)).getUTCDate();
+      setRange(ly, lm, 1, ly, lm, lastDay);
+    }
+  }
+  var quickBar = el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' } },
+    el('button', { class: 'elmi-chip-btn', type: 'button' }, 'Letzte 7 Tage'),
+    el('button', { class: 'elmi-chip-btn', type: 'button' }, 'Letzte 30 Tage'),
+    el('button', { class: 'elmi-chip-btn', type: 'button' }, 'Laufender Monat'),
+    el('button', { class: 'elmi-chip-btn', type: 'button' }, 'Letzter Monat'));
+  var qk = ['7', '30', 'cur', 'last'];
+  Array.prototype.slice.call(quickBar.children).forEach(function(b, i){ b.addEventListener('click', function(){ quick(qk[i]); }); });
+
+  function parseDateStr(s){ var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ''); return m ? { y: +m[1], m: +m[2], d: +m[3] } : null; }
+  function updateUtcHint(){
+    var tz = activeTz();
+    var f = parseDateStr(fromInput.value), t = parseDateStr(toInput.value);
+    if (!f || !t){ utcHint.textContent = ''; return; }
+    var fromUtc = zonedToUtc(f.y, f.m, f.d, 0, 0, tz);
+    var toEx = new Date(Date.UTC(t.y, t.m - 1, t.d)); toEx.setUTCDate(toEx.getUTCDate() + 1);
+    var toUtc = zonedToUtc(toEx.getUTCFullYear(), toEx.getUTCMonth() + 1, toEx.getUTCDate(), 0, 0, tz);
+    utcHint.textContent = 'Abgefragter UTC-Bereich: ' + isoUtcTrim(fromUtc) + '  bis  ' + isoUtcTrim(toUtc)
+      + '   (Eingabe als ' + tzShort(tz) + ' interpretiert)';
+  }
+  fromInput.addEventListener('change', updateUtcHint);
+  toInput.addEventListener('change', updateUtcHint);
+  setTimeout(updateUtcHint, 0);
+
+  /* Key-Feld (nur wenn kein Key gesetzt) + Zuruecksetzen-Link */
+  var keyInput = el('input', { type: 'password', id: 'elmi-live-key', placeholder: 'Dashboard-Key', autocomplete: 'off', style: { width: '260px' } });
+  var keyField = labeledField('Dashboard-Key (einmalig)', keyInput);
+  var resetLink = el('button', { class: 'elmi-ghost-link', type: 'button' }, 'Key zuruecksetzen');
+  var keyRow = el('div', { id: 'elmi-key-row', style: { display: 'flex', gap: '10px', alignItems: 'flex-end', marginTop: '4px' } }, keyField);
+  var resetRow = el('div', { id: 'elmi-key-reset', style: { marginTop: '4px' } }, resetLink);
+  function refreshKeyUi(){
+    if (keyIsSet()){ keyRow.style.display = 'none'; resetRow.style.display = 'block'; }
+    else { keyRow.style.display = 'flex'; resetRow.style.display = 'none'; }
+  }
+  resetLink.addEventListener('click', function(){ sessionStorage.removeItem(KEY_SS); refreshKeyUi(); showStatus(status, 'ℹ️ Key entfernt. Bitte neu eingeben.', 'info'); });
+  refreshKeyUi();
+
+  /* In-Session-Geraeteumschalter (nach Abruf sichtbar) */
+  var switchWrap = el('div', { id: 'elmi-live-switch', style: { display: 'none', marginTop: '10px' } });
+
+  /* Abruf-Button + Abbrechen */
+  var btn = el('button', { id: 'elmi-live-btn', class: 'elmi-live-btn', type: 'button' }, '📡 Daten abrufen');
+  var cancelBtn = el('button', { class: 'elmi-chip-btn', type: 'button', style: { display: 'none' } }, 'Abbrechen');
+  cancelBtn.addEventListener('click', function(){ if (_abort) _abort.abort(); });
+
+  btn.addEventListener('click', function(){ runFetch(devList, fromInput, toInput, keyInput, status, btn, cancelBtn, switchWrap, refreshKeyUi); });
+
+  /* Zustand nach Neu-Injektion (Recompute rebaut den Settings-Tab) wiederherstellen */
+  if (_lastStatus) showStatus(status, _lastStatus.msg, _lastStatus.type);
+  var _fetched = Object.keys(_fetchedDbs);
+  if (_fetched.length >= 2) buildDeviceSwitcher(switchWrap, _fetched, status);
+
+  return el('div', { id: 'elmi-live-section' },
+    el('div', { class: 'section-title', style: { marginTop: '0' } }, '🔌 Live-Daten abrufen'),
+    el('div', { class: 'settings-hint' }, 'Ruft Telemetrie direkt ueber den gesicherten ELMI-Worker ab — kein Excel-Export noetig. Daten landen im selben Speicher wie hochgeladene Dateien.'),
+    el('div', { class: 'input-hint', style: { marginTop: '12px' } }, 'Geraete'),
+    devList,
+    el('div', { class: 'input-hint', style: { marginTop: '12px' } }, 'Zeitraum'),
+    el('div', { style: { display: 'flex', gap: '10px', alignItems: 'flex-end', flexWrap: 'wrap' } },
+      labeledField('Von', fromInput), labeledField('Bis', toInput)),
+    quickBar, utcHint,
+    keyRow, resetRow,
+    el('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '14px' } }, btn, cancelBtn),
+    switchWrap,
     status);
 }
 
-function injectLiveSection(page){
-  if (!page) return;
-  ensureStyles();
-  if (page.querySelector('#elmi-live-section')) return;
-  var section = buildLiveSection();
-  var anchor = page.querySelector('#elmi-folder-section') || page.querySelector('.ds-card');
-  if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(section, anchor.nextSibling);
-  else page.appendChild(section);
+async function runFetch(devList, fromInput, toInput, keyInput, status, btn, cancelBtn, switchWrap, refreshKeyUi){
+  var tz = activeTz();
+  var sns = Array.prototype.slice.call(devList.querySelectorAll('input:checked')).map(function(c){ return c.value; });
+  if (!sns.length){ showStatus(status, '⚠️ Bitte mindestens ein Geraet waehlen.', 'warn'); return; }
+  var f = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fromInput.value), t = /^(\d{4})-(\d{2})-(\d{2})$/.exec(toInput.value);
+  if (!f || !t){ showStatus(status, '⚠️ Bitte Von- und Bis-Datum waehlen.', 'warn'); return; }
+  var fromUtc = zonedToUtc(+f[1], +f[2], +f[3], 0, 0, tz);
+  var toEx = new Date(Date.UTC(+t[1], +t[2] - 1, +t[3])); toEx.setUTCDate(toEx.getUTCDate() + 1);
+  var toUtc = zonedToUtc(toEx.getUTCFullYear(), toEx.getUTCMonth() + 1, toEx.getUTCDate(), 0, 0, tz);
+  if (toUtc <= fromUtc){ showStatus(status, '⚠️ Bis-Datum muss nach dem Von-Datum liegen.', 'warn'); return; }
+  var rangeDays = (toUtc - fromUtc) / 86400000;
+  if (rangeDays > API_CONFIG.maxRangeDays){ showStatus(status, '⚠️ Zeitraum zu lang (max. ' + API_CONFIG.maxRangeDays + ' Tage).', 'warn'); return; }
+
+  /* Key ggf. aus Eingabefeld uebernehmen */
+  if (!keyIsSet()){
+    var kv = (keyInput.value || '').trim();
+    if (!kv){ showStatus(status, '⚠️ Bitte den Dashboard-Key eingeben.', 'warn'); return; }
+    sessionStorage.setItem(KEY_SS, kv);
+    keyInput.value = '';
+    refreshKeyUi();
+  }
+
+  _abort = new AbortController();
+  var orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Laedt…'; cancelBtn.style.display = 'inline-block';
+  var onProgress = function(msg){ showStatus(status, '⏳ ' + msg, 'info'); };
+  try{
+    var out = await fetchDeviceAnalysis({ sns: sns, from: fromUtc, to: toUtc, onProgress: onProgress, signal: _abort.signal });
+    /* nach SN gruppieren */
+    var bySn = {}; sns.forEach(function(s){ bySn[s] = []; });
+    out.rows.forEach(function(r){ (bySn[r.sn] || (bySn[r.sn] = [])).push(r); });
+    var stationDbs = {}, totalRows = 0, withData = [];
+    Object.keys(bySn).forEach(function(sn){
+      var rows = apiRowsToRows(bySn[sn]);
+      if (!rows.length) return;
+      stationDbs[sn] = buildDB(sn, rows);
+      _fetchedDbs[sn] = stationDbs[sn];
+      totalRows += rows.length; withData.push(sn);
+    });
+    if (!withData.length){ showStatus(status, '⚠️ Keine Datenpunkte im gewaehlten Zeitraum.', 'warn'); return; }
+
+    await persistApiStations(stationDbs);
+
+    /* erstes Geraet anzeigen */
+    var firstSn = withData[0];
+    window.ELMI.app.applyDB(stationDbs[firstSn], null);
+    window.ELMI.app._dataSource = 'Live API · ' + firstSn + ' · ' + fmtStamp(new Date());
+    window.ELMI.app.render();
+    updateZoneBadges();
+
+    buildDeviceSwitcher(switchWrap, withData, status);
+
+    var msg = '✅ ' + totalRows.toLocaleString('de') + ' Datensaetze fuer ' + withData.length + ' Geraet(e) geladen.\n'
+      + 'Zeitraum ' + isoUtcTrim(fromUtc) + ' bis ' + isoUtcTrim(toUtc) + ' (UTC).';
+    if (out.errors && out.errors.length){
+      var wins = out.errors.map(function(e){ return e.sn + ' ' + e.from + '…' + e.to; }).join('\n  ');
+      showStatus(status, '⚠️ Teilweise geladen — folgende Zeitfenster fehlen:\n  ' + wins + '\n\n' + msg, 'warn');
+    } else {
+      showStatus(status, msg + (withData.length > 1 ? '\nGeraet unten umschaltbar.' : ''), 'ok');
+    }
+  }catch(err){
+    if (err.name === 'AbortError'){ showStatus(status, 'ℹ️ Abruf abgebrochen.', 'info'); }
+    else if (err.code === 401){ refreshKeyUi(); showStatus(status, '❌ ' + err.message + ' — bitte Key erneut eingeben.', 'error'); }
+    else if (err.code === 403){ showStatus(status, '❌ ' + err.message + ' (403). Das kann nur das Backend-Team freischalten.', 'error'); }
+    else if (err.code === 'NOKEY'){ refreshKeyUi(); showStatus(status, '⚠️ Bitte den Dashboard-Key eingeben.', 'warn'); }
+    else { showStatus(status, '❌ ' + (err.message || err), 'error'); }
+  }finally{
+    _abort = null;
+    btn.disabled = false; btn.textContent = orig; cancelBtn.style.display = 'none';
+  }
 }
 
+function buildDeviceSwitcher(wrap, sns, status){
+  wrap.innerHTML = '';
+  if (sns.length < 2){ wrap.style.display = 'none'; return; }
+  var sel = el('select', { id: 'elmi-live-active' });
+  sns.forEach(function(sn){ sel.appendChild(el('option', { value: sn }, sn)); });
+  sel.addEventListener('change', function(){
+    var db = _fetchedDbs[sel.value];
+    if (!db) return;
+    window.ELMI.app.applyDB(db, null);
+    window.ELMI.app._dataSource = 'Live API · ' + sel.value + ' · ' + fmtStamp(new Date());
+    window.ELMI.app.render();
+    updateZoneBadges();
+  });
+  wrap.appendChild(labeledField('Angezeigtes Geraet', sel));
+  wrap.style.display = 'block';
+}
+
+/* ================= UI: Settings-Zeitzone ========================== */
+function buildTzSection(){
+  ensureStyles();
+  var sel = el('select', { id: 'elmi-tz-select' });
+  var cur = activeTz();
+  API_CONFIG.timezones.forEach(function(z){
+    var o = el('option', { value: z.id }, z.label);
+    if (z.id === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+  var badge = el('span', { class: 'elmi-zone-badge', id: 'elmi-tz-active' }, tzShort(cur));
+  sel.addEventListener('change', function(){
+    localStorage.setItem(TZ_LS, sel.value);
+    document.dispatchEvent(new CustomEvent('elmi:timezone-changed', { detail: { tz: sel.value } }));
+  });
+  return el('div', { id: 'elmi-tz-section' },
+    el('div', { class: 'section-title', style: { marginTop: '0' } }, '🕒 Anzeigezeitzone ', badge),
+    el('div', { class: 'settings-hint' }, 'Alle Zeiten sind intern UTC. Die Auswahl rechnet Charts, Achsen, Tooltips und tageweise Summen sofort in die gewaehlte Zone um — ohne Neu-Abruf.'),
+    el('div', { style: { marginTop: '10px' } }, labeledField('Zone', sel)));
+}
+function updateZoneBadges(){
+  var b = document.getElementById('elmi-tz-active');
+  if (b) b.textContent = tzShort(activeTz());
+}
+
+/* ================= Injektion in den Settings-/Input-Tab =========== */
+function injectSections(page){
+  if (!page) return;
+  ensureStyles();
+  if (!page.querySelector('#elmi-live-section')){
+    var live = buildLiveSection();
+    var anchor = page.querySelector('#elmi-folder-section') || page.querySelector('.ds-card');
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(live, anchor.nextSibling);
+    else page.appendChild(live);
+  }
+  if (!page.querySelector('#elmi-tz-section')){
+    var tz = buildTzSection();
+    var liveEl = page.querySelector('#elmi-live-section');
+    if (liveEl && liveEl.parentNode) liveEl.parentNode.insertBefore(tz, liveEl.nextSibling);
+    else page.appendChild(tz);
+  }
+}
 function tryInject(){
   if (location.hash !== '#input' && location.hash !== '') return;
   var page = document.querySelector('#content .page');
-  if (!page) return;
-  injectLiveSection(page);
+  if (page) injectSections(page);
 }
 
+/* Zone-Wechsel: alle Ansichten neu rendern (ohne Reload/Abruf) */
+document.addEventListener('elmi:timezone-changed', reapplyZone);
+
+/* applyDB-Patch installieren, sobald der Kern bereit ist */
+var _pi = 0, _piv = setInterval(function(){
+  _pi++;
+  if (installApplyPatch()){
+    clearInterval(_piv);
+    /* ggf. bereits gerendertes Dataset einmal in aktiver Zone nachziehen */
+    setTimeout(function(){ if (_canonicalDb) reapplyZone(); }, 600);
+  } else if (_pi > 80){ clearInterval(_piv); }
+}, 150);
+
+/* Settings-Tab beobachten (DOM wird bei jedem Recompute neu gebaut) */
 function startWatching(){
   var contentEl = document.getElementById('content');
   if (!contentEl) return false;
-  var obs = new MutationObserver(function(){ tryInject(); });
-  obs.observe(contentEl, {childList: true, subtree: true});
+  new MutationObserver(function(){ tryInject(); }).observe(contentEl, { childList: true, subtree: true });
   window.addEventListener('hashchange', tryInject);
   tryInject();
   return true;
 }
-
-var _lsi = 0, _lsiv = setInterval(function(){
-  _lsi++;
-  if (startWatching() || _lsi > 60) clearInterval(_lsiv);
-}, 200);
+var _lsi = 0, _lsiv = setInterval(function(){ _lsi++; if (startWatching() || _lsi > 80) clearInterval(_lsiv); }, 200);
 
 })();
 </script>
