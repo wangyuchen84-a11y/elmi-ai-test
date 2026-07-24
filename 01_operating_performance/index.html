@@ -1508,34 +1508,50 @@ var API_CONFIG = {
 };
 var KEY_SS = 'elmi.apiKey';    // sessionStorage-Schluessel fuer den Dashboard-Key
 var TZ_LS  = 'elmi.timezone';  // localStorage-Schluessel fuer die Anzeigezeitzone
-var LABELS_LS = 'elmi.deviceLabels'; // {sn: label} — vom Nutzer im UI vergebene Namen (nur dieser Browser)
+var USERDEV_LS = 'elmi.userDevices'; // vom Nutzer im UI ergaenzte Seriennummern (nur dieser Browser)
 
-function getLabelOverrides(){ try{ return JSON.parse(localStorage.getItem(LABELS_LS) || '{}') || {}; }catch(e){ return {}; } }
-function setLabelOverrides(map){ localStorage.setItem(LABELS_LS, JSON.stringify(map)); }
-/* Anzeigename: Browser-Override > devices.json-Label > Seriennummer. */
-function resolveLabel(dv){
-  var o = getLabelOverrides();
-  var ov = o[dv.sn];
-  return (ov && String(ov).trim()) || dv.label || dv.sn;
-}
-/* Baut die Namen-Editor-Zeilen in `wrap` neu auf (SN + Eingabefeld). */
-function renderDevNames(wrap, devices){
-  if (!wrap) return;
-  var o = getLabelOverrides();
-  wrap.innerHTML = '';
-  devices.forEach(function(dv){
-    var inp = el('input', { type: 'text', value: (o[dv.sn] || ''), placeholder: dv.label || dv.sn, style: { flex: '1', minWidth: '160px' } });
-    inp.setAttribute('data-sn', dv.sn);
-    wrap.appendChild(el('div', { class: 'elmi-devname-row' }, el('span', { class: 'elmi-sn' }, dv.sn), inp));
-  });
-}
-/* Dropdown-Beschriftungen anhand der aktuellen Namen neu setzen. */
-function relabelDropdown(){
+function getUserDevices(){ try{ var a = JSON.parse(localStorage.getItem(USERDEV_LS) || '[]'); return Array.isArray(a) ? a.filter(Boolean) : []; }catch(e){ return []; } }
+function setUserDevices(arr){ localStorage.setItem(USERDEV_LS, JSON.stringify(arr)); }
+function addUserDevice(sn){ var a = getUserDevices(); if (a.indexOf(sn) < 0){ a.push(sn); setUserDevices(a); } }
+function removeUserDevice(sn){ setUserDevices(getUserDevices().filter(function(s){ return s !== sn; })); }
+function normalizeSn(s){ return String(s || '').trim().toUpperCase().replace(/\s+/g, ''); }
+
+/* Baut die #elmi-dev-select-Optionen aus _deviceCache neu auf (Auswahl bleibt). */
+function rebuildDropdown(){
   var sel = document.getElementById('elmi-dev-select');
   if (!sel || !_deviceCache) return;
-  Array.prototype.slice.call(sel.options).forEach(function(op){
-    var dv = _deviceCache.filter(function(d){ return d.sn === op.value; })[0] || { sn: op.value };
-    op.textContent = resolveLabel(dv);
+  var want = _selectedSn || sel.value;
+  sel.innerHTML = '';
+  _deviceCache.forEach(function(dv){ sel.appendChild(el('option', { value: dv.sn }, dv.label || dv.sn)); });
+  if (want && _deviceCache.some(function(d){ return d.sn === want; })) sel.value = want;
+  _selectedSn = sel.value;
+}
+/* Verwalten-Liste (SN + Herkunft + Entfernen fuer selbst hinzugefuegte) in `wrap`. */
+function renderDevManageList(wrap){
+  if (!wrap) return;
+  var user = getUserDevices();
+  wrap.innerHTML = '';
+  (_deviceCache || []).forEach(function(dv){
+    var isUser = user.indexOf(dv.sn) >= 0;
+    var row = el('div', { class: 'elmi-devname-row' },
+      el('span', { class: 'elmi-sn' }, dv.sn),
+      el('span', { class: 'elmi-src' }, isUser ? 'selbst hinzugefuegt' : 'Standard'));
+    if (isUser){
+      var rm = el('button', { class: 'elmi-ghost-link', type: 'button' }, '✕ entfernen');
+      rm.addEventListener('click', function(){ removeUserDevice(dv.sn); reloadDevicesEverywhere(); });
+      row.appendChild(rm);
+    }
+    wrap.appendChild(row);
+  });
+}
+/* Geraeteliste (Basis + Nutzer) neu laden und ueberall aktualisieren. */
+function reloadDevicesEverywhere(){
+  return loadDeviceList().then(function(devs){
+    _deviceCache = devs;
+    rebuildDropdown();
+    renderDevManageList(document.getElementById('elmi-devmanage-list'));
+    var dh = document.getElementById('elmi-dev-hint'); if (dh) dh.textContent = devs.length + ' Geraet(e) verfuegbar.';
+    return devs;
   });
 }
 
@@ -1795,12 +1811,13 @@ function ensureStyles(){
     + '.elmi-dev-list label{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--fg1,#1b1b22);}'
     + '.elmi-utc-hint{font-size:11px;color:var(--fg2,#6b6b76);margin-top:6px;}'
     + '.elmi-zone-badge{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:12px;background:rgba(109,42,153,.12);color:#6D2A99;font-size:11px;font-weight:600;}'
-    + '#elmi-devnames-section{margin-top:14px;padding:18px 20px;border:1.5px dashed var(--elmi-orange,#F39A3A);border-radius:var(--radius-md,8px);background:rgba(243,154,58,.06);}'
-    + '#elmi-devnames-section input[type=text]{background:#fff;color:var(--fg1,#1b1b22);border:1px solid var(--border-2,#d1d1d8);border-radius:6px;padding:6px 10px;font-size:13px;}'
-    + '.elmi-devnames-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;}'
+    + '#elmi-devmanage-section{margin-top:14px;padding:18px 20px;border:1.5px dashed var(--elmi-orange,#F39A3A);border-radius:var(--radius-md,8px);background:rgba(243,154,58,.06);}'
+    + '#elmi-devmanage-section input[type=text]{background:#fff;color:var(--fg1,#1b1b22);border:1px solid var(--border-2,#d1d1d8);border-radius:6px;padding:6px 10px;font-size:13px;}'
+    + '.elmi-devnames-list{display:flex;flex-direction:column;gap:8px;margin-top:8px;}'
     + '.elmi-devname-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}'
-    + '.elmi-devname-row .elmi-sn{font-family:monospace;font-size:11.5px;color:var(--fg2,#6b6b76);min-width:190px;}'
-    + '@media(max-width:380px){#elmi-live-section,#elmi-tz-section,#elmi-devnames-section{padding:14px;}}';
+    + '.elmi-devname-row .elmi-sn{font-family:monospace;font-size:11.5px;color:var(--fg1,#1b1b22);min-width:190px;}'
+    + '.elmi-devname-row .elmi-src{font-size:11px;color:var(--fg2,#6b6b76);}'
+    + '@media(max-width:380px){#elmi-live-section,#elmi-tz-section,#elmi-devmanage-section{padding:14px;}}';
   document.head.appendChild(el('style', { id: 'elmi-live-api-css' }, css));
 }
 var _lastStatus = null;   // ueberlebt die Neu-Injektion des Settings-Tab
@@ -1817,12 +1834,11 @@ function labeledField(label, input){ return el('div', { class: 'elmi-live-field'
 
 function keyIsSet(){ return !!sessionStorage.getItem(KEY_SS); }
 
-/* Geraeteliste laden. Keine Discovery-API vorhanden -> Quelle ist eine
-   Datei im Repo, die der „Aktualisieren"-Button jedes Mal frisch zieht:
-   1) devices.json  2) data/manifest.json (Dateiname->SN)  3) eingebaute Liste. */
+/* Basis-Geraeteliste. Keine Discovery-API vorhanden -> Quelle ist eine
+   Datei im Repo: 1) devices.json  2) data/manifest.json  3) eingebaute Liste. */
 var _deviceCache = null;
 var _selectedSn = null;   // gewaehltes Geraet ueber Neu-Injektionen hinweg merken
-async function loadDeviceList(){
+async function loadBaseDeviceList(){
   try{
     var r = await fetch('devices.json?t=' + Date.now(), { cache: 'no-store' });
     if (r.ok){
@@ -1845,6 +1861,17 @@ async function loadDeviceList(){
   return API_CONFIG.devices.slice();
 }
 
+/* Effektive Liste = Basis + selbst hinzugefuegte SNs, dedupliziert nach SN. */
+async function loadDeviceList(){
+  var base = await loadBaseDeviceList();
+  var seen = {}, out = [];
+  base.concat(getUserDevices()).forEach(function(dv){
+    var o = (typeof dv === 'string') ? { sn: dv, label: dv } : { sn: dv.sn, label: dv.label || dv.sn };
+    if (o.sn && !seen[o.sn]){ seen[o.sn] = 1; out.push(o); }
+  });
+  return out;
+}
+
 function buildLiveSection(){
   ensureStyles();
   var status = el('div', { id: 'elmi-live-status', class: 'elmi-live-status hidden' });
@@ -1856,7 +1883,7 @@ function buildLiveSection(){
   function fillDevSelect(devices){
     var want = _selectedSn || devSelect.value;
     devSelect.innerHTML = '';
-    devices.forEach(function(dv){ devSelect.appendChild(el('option', { value: dv.sn }, resolveLabel(dv))); });
+    devices.forEach(function(dv){ devSelect.appendChild(el('option', { value: dv.sn }, dv.label || dv.sn)); });
     if (want && devices.some(function(d){ return d.sn === want; })) devSelect.value = want;
     _selectedSn = devSelect.value;
     _deviceCache = devices;
@@ -1867,7 +1894,7 @@ function buildLiveSection(){
     try{
       var devices = await loadDeviceList();
       fillDevSelect(devices);
-      renderDevNames(document.getElementById('elmi-devnames-list'), devices);
+      renderDevManageList(document.getElementById('elmi-devmanage-list'));
       devHint.textContent = devices.length + ' Geraet(e) verfuegbar.';
     }catch(e){
       fillDevSelect(API_CONFIG.devices);
@@ -2087,30 +2114,32 @@ function updateZoneBadges(){
   if (b) b.textContent = tzShort(activeTz());
 }
 
-/* ================= UI: Settings-Geraetenamen ====================== */
-function buildDevNamesSection(){
+/* ================= UI: Settings-Geraeteverwaltung ================= */
+function buildDevManageSection(){
   ensureStyles();
-  var listWrap = el('div', { id: 'elmi-devnames-list', class: 'elmi-devnames-list' });
-  var hint = el('div', { class: 'elmi-utc-hint', id: 'elmi-devnames-hint' });
-  var saveBtn = el('button', { class: 'elmi-live-btn', type: 'button' }, 'Namen speichern');
-  saveBtn.addEventListener('click', function(){
-    var o = {};
-    Array.prototype.slice.call(listWrap.querySelectorAll('input[data-sn]')).forEach(function(inp){
-      var v = (inp.value || '').trim();
-      if (v) o[inp.getAttribute('data-sn')] = v;
-    });
-    setLabelOverrides(o);
-    relabelDropdown();
-    hint.textContent = '✓ Gespeichert. Leere Felder verwenden wieder die Seriennummer.';
-  });
-  var devs = (_deviceCache && _deviceCache.length) ? _deviceCache : API_CONFIG.devices;
-  renderDevNames(listWrap, devs);
-  return el('div', { id: 'elmi-devnames-section' },
-    el('div', { class: 'section-title', style: { marginTop: '0' } }, '🏷️ Geraetenamen'),
-    el('div', { class: 'settings-hint' }, 'Anzeigename je Geraet fuer das Dropdown. Wird nur in diesem Browser gespeichert; leer = Seriennummer. Fuer alle Nutzer sichtbare Namen gehoeren in devices.json.'),
-    listWrap,
-    el('div', { style: { marginTop: '10px' } }, saveBtn),
-    hint);
+  var listWrap = el('div', { id: 'elmi-devmanage-list', class: 'elmi-devnames-list' });
+  var hint = el('div', { class: 'elmi-utc-hint', id: 'elmi-devmanage-hint' });
+  var snInput = el('input', { type: 'text', id: 'elmi-add-sn', placeholder: 'z. B. A131120000009999999999', style: { flex: '1', minWidth: '200px' } });
+  var addBtn = el('button', { class: 'elmi-live-btn', type: 'button' }, '➕ Hinzufuegen');
+  function doAdd(){
+    var sn = normalizeSn(snInput.value);
+    if (!sn){ hint.textContent = 'Bitte eine Seriennummer eingeben.'; return; }
+    if ((_deviceCache || []).some(function(d){ return d.sn === sn; })){ hint.textContent = 'Diese Seriennummer ist bereits in der Liste.'; return; }
+    addUserDevice(sn);
+    snInput.value = '';
+    _selectedSn = sn;
+    reloadDevicesEverywhere().then(function(){ hint.textContent = '✓ Hinzugefuegt: ' + sn; });
+  }
+  addBtn.addEventListener('click', doAdd);
+  snInput.addEventListener('keydown', function(e){ if (e.key === 'Enter'){ e.preventDefault(); doAdd(); } });
+  renderDevManageList(listWrap);
+  return el('div', { id: 'elmi-devmanage-section' },
+    el('div', { class: 'section-title', style: { marginTop: '0' } }, '🔧 Geraete verwalten'),
+    el('div', { class: 'settings-hint' }, 'Eigene Seriennummern hinzufuegen. Sie erscheinen sofort im Dropdown. Wird nur in diesem Browser gespeichert; fuer alle Nutzer sichtbare Geraete gehoeren in devices.json.'),
+    el('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap', marginTop: '10px' } }, snInput, addBtn),
+    hint,
+    el('div', { class: 'input-hint', style: { marginTop: '12px' } }, 'Aktuelle Geraete'),
+    listWrap);
 }
 
 /* ================= Injektion in den Settings-/Input-Tab =========== */
@@ -2129,8 +2158,8 @@ function injectSections(page){
     if (liveEl && liveEl.parentNode) liveEl.parentNode.insertBefore(tz, liveEl.nextSibling);
     else page.appendChild(tz);
   }
-  if (!page.querySelector('#elmi-devnames-section')){
-    var dn = buildDevNamesSection();
+  if (!page.querySelector('#elmi-devmanage-section')){
+    var dn = buildDevManageSection();
     var tzEl = page.querySelector('#elmi-tz-section');
     if (tzEl && tzEl.parentNode) tzEl.parentNode.insertBefore(dn, tzEl.nextSibling);
     else page.appendChild(dn);
